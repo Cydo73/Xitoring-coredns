@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitoring CoreDNS in Kubernetes with Xitoring</title>
+<meta name="description" content="A tested walkthrough of Xitoring’s CoreDNS monitoring on a local Kubernetes cluster, with findings and suggested fixes.">
+<style>
+:root{--bg:#fff;--fg:#1c2326;--mute:#5b676c;--line:#d9e1e3;--accent:#0d7a7a;--soft:#e8f4f4;--code:#f3f6f7}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14191b;--fg:#e6ecee;--mute:#9aa8ad;--line:#2b3438;--accent:#4fc3c3;--soft:#1b2a2c;--code:#1c2326}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.65 system-ui,-apple-system,"Segoe UI",Arial,sans-serif}
+main{max-width:760px;margin:0 auto;padding:48px 20px 72px}
+h1{font-size:2rem;line-height:1.2;margin:0 0 8px}
+h2{font-size:1.45rem;margin:56px 0 12px;padding-top:8px;border-top:1px solid var(--line)}
+h3{font-size:1.1rem;margin:32px 0 6px}
+p,li{max-width:68ch}
+.lead{color:var(--mute);font-size:1.05rem}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0 0;padding:0;list-style:none}
+.meta li{background:var(--soft);border-radius:6px;padding:4px 10px;font-size:.85rem}
+code,pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.88rem}
+code{background:var(--code);padding:1px 5px;border-radius:4px}
+pre{background:var(--code);padding:14px 16px;border-radius:8px;overflow-x:auto;border-left:3px solid var(--accent)}
+pre code{background:none;padding:0}
+figure{margin:20px 0}
+figure img{width:100%;height:auto;border:1px solid var(--line);border-radius:8px;display:block}
+figcaption{color:var(--mute);font-size:.85rem;margin-top:6px}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.pair figure{margin:20px 0 0}
+@media (max-width:640px){.pair{grid-template-columns:1fr}}
+.table-wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.95rem}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--soft)}
+.finding{border-left:3px solid var(--accent);background:var(--soft);padding:4px 18px 10px;border-radius:0 8px 8px 0;margin:24px 0}
+.finding h3{margin-top:14px}
+.fix{margin:6px 0 0}
+.fix b{color:var(--accent)}
+svg{width:100%;height:auto;margin:16px 0}
+svg text{fill:var(--fg);font:13px system-ui,Arial,sans-serif}
+svg .box{fill:var(--soft);stroke:var(--accent);stroke-width:1.5}
+svg .line{stroke:var(--accent);stroke-width:1.5;fill:none}
+svg .head{fill:var(--accent)}
+footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);color:var(--mute);font-size:.9rem}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+
+<h1>Monitoring CoreDNS in Kubernetes with Xitoring</h1>
+<p class="lead">I tried Xitoring the way a new customer would, wrote down every place I got stuck, and worked out what I’d change. This is an independent sample, not official Xitoring documentation.</p>
+<ul class="meta">
+<li>Tested 17 and 18 November 2026</li>
+<li>Xitogent 2.13</li>
+<li>CoreDNS 1.11.1</li>
+<li>Dashboard v3.3, then v3.4</li>
+<li>kind v0.24.0, one node</li>
+</ul>
+
+<h2>1. What we were trying to accomplish</h2>
+<p>Xitoring has a knowledge base article on monitoring CoreDNS. For Kubernetes it says to deploy the Xitogent agent as a DaemonSet. I wanted to know whether a brand new customer can follow that path and end up with a working alert.</p>
+<p>So I played the customer: a local cluster, a free trial, and the docs open in another tab. There were three goals.</p>
+<ul>
+<li>Get CoreDNS metrics from a Kubernetes cluster into the Xitoring dashboard.</li>
+<li>Get an alert when the DNS cache hit rate drops.</li>
+<li>See what happens when CoreDNS disappears completely.</li>
+</ul>
+
+<h2>2. How we did it</h2>
+
+<h3>Step 1. Create a cluster and install the agent</h3>
+<p>I created a one node cluster with kind, which runs Kubernetes inside Docker. A kind node is just a container, so I stepped inside it and installed Xitogent like I would on a server.</p>
+<pre><code>kind create cluster --name xito-lab
+docker exec -it xito-lab-control-plane bash
+apt-get update &amp;&amp; apt-get install -y sudo curl</code></pre>
+<p>The install command from Xitoring starts with <code>sudo</code>, and the node image doesn’t have it, so the first attempt failed. After installing it, the command ran and the dashboard picked up the server within a minute.</p>
+<div class="pair">
+<figure><img src="images/01-activate-server.png" alt="Xitoring Activate your server screen listening for a server, with the install command covered"><figcaption>The install screen waits for the agent. My key is covered.</figcaption></figure>
+<figure><img src="images/02-server-connected.png" alt="Xitoring confirmation screen showing server connected and streaming metrics"><figcaption>A minute later the server shows as connected.</figcaption></figure>
+</div>
+
+<h3>Step 2. Connect CoreDNS</h3>
+<p>Here is the picture that took me a while to work out. CoreDNS runs in a pod, but the agent runs on the node and, by default, looks for CoreDNS on its own localhost.</p>
+<svg viewBox="0 0 700 150" role="img" aria-label="Diagram: the CoreDNS pod exposes metrics on port 9153 through the kube-dns service, Xitogent on the node reads them, and sends them to the Xitoring dashboard, which emails alerts">
+<rect class="box" x="10" y="45" width="150" height="60" rx="8"/><text x="85" y="72" text-anchor="middle">CoreDNS pod</text><text x="85" y="92" text-anchor="middle">port 9153</text>
+<rect class="box" x="195" y="45" width="150" height="60" rx="8"/><text x="270" y="72" text-anchor="middle">Xitogent</text><text x="270" y="92" text-anchor="middle">on the node</text>
+<rect class="box" x="380" y="45" width="150" height="60" rx="8"/><text x="455" y="72" text-anchor="middle">Xitoring</text><text x="455" y="92" text-anchor="middle">dashboard</text>
+<rect class="box" x="565" y="45" width="125" height="60" rx="8"/><text x="627" y="82" text-anchor="middle">Alert email</text>
+<path class="line" d="M160 75H189"/><polygon class="head" points="195,75 187,71 187,79"/>
+<path class="line" d="M345 75H374"/><polygon class="head" points="380,75 372,71 372,79"/>
+<path class="line" d="M530 75H559"/><polygon class="head" points="565,75 557,71 557,79"/>
+<text x="177" y="35" text-anchor="middle">kube-dns service</text><text x="177" y="125" text-anchor="middle">http://10.96.0.10</text>
+</svg>
+<p>The dashboard’s CoreDNS card said the integration was not detected, and the Enable button stayed greyed out.</p>
+<figure><img src="images/03-not-detected.png" alt="CoreDNS integration popup saying this integration was not detected, with Enable disabled"><figcaption>The first thing I saw. Enable is greyed out.</figcaption></figure>
+<p>The command line has a way round it. It asks for a metrics host and port, so I gave it the address of the kube-dns service.</p>
+<pre><code>xitogent integrate
+Enter CoreDNS metrics host (default: http://127.0.0.1): http://10.96.0.10
+Enter CoreDNS metrics port (default: 9153): 9153
+integration setup was successful and config file updated.</code></pre>
+<figure><img src="images/04-coredns-enabled.png" alt="Server page with the CoreDNS integration card showing Enabled"><figcaption>After that, CoreDNS shows as Enabled.</figcaption></figure>
+
+<h3>Step 3. Give CoreDNS something to do</h3>
+<p>On a quiet cluster every graph sat at zero, because the counters only move when something asks a question. I started a small pod that keeps doing lookups.</p>
+<pre><code>kubectl run dns-test --image=busybox:1.28 --restart=Never -- sh -c "while true; do nslookup kubernetes.default; nslookup example.com; sleep 1; done"</code></pre>
+<div class="pair">
+<figure><img src="images/05-graphs-flat.png" alt="CoreDNS cache and request graphs flat at zero"><figcaption>Before any traffic.</figcaption></figure>
+<figure><img src="images/06-graphs-traffic.png" alt="CoreDNS cache and request graphs rising once lookups began"><figcaption>After the lookup pod started.</figcaption></figure>
+</div>
+
+<h3>Step 4. Create an alert</h3>
+<p>On the server’s Triggers tab, the Add trigger button has a CoreDNS option. The form opens with a metric and threshold that make no sense together (panics above 80), so I changed it to the cache hit percentage, below 80. My live reading was about 62, so the alert was certain to fire. On a real cluster you would pick a threshold from your own baseline.</p>
+<div class="pair">
+<figure><img src="images/07-add-trigger.png" alt="Add trigger dropdown listing Metric, Services and CoreDNS"><figcaption>Add trigger, with CoreDNS in the list.</figcaption></figure>
+<figure><img src="images/08-trigger-form.png" alt="New CoreDNS trigger form set to cache hit percentage below 80 with the default notification role"><figcaption>The finished form, with a plain English summary at the bottom.</figcaption></figure>
+</div>
+
+<h3>Step 5. Break CoreDNS on purpose</h3>
+<pre><code>kubectl -n kube-system scale deployment coredns --replicas=0</code></pre>
+
+<h2>3. Findings and results</h2>
+
+<h3>What happened</h3>
+<div class="table-wrap"><table>
+<tr><th>Test</th><th>Result</th></tr>
+<tr><td>Agent install</td><td>About a minute. Failed once because the node image has no <code>sudo</code>.</td></tr>
+<tr><td>CoreDNS integration</td><td>Worked once I entered the kube-dns address in the command line.</td></tr>
+<tr><td>Graphs</td><td>Moved off zero within a few minutes of starting the lookup pod.</td></tr>
+<tr><td>Threshold alert</td><td>Saved at about 05:15 UTC. The incident opened at 05:19:06 UTC and the email arrived in the same minute.</td></tr>
+<tr><td>Data going silent</td><td>After scaling CoreDNS to zero, a second incident (Heartbeat) opened at 05:26:16 UTC, and an email said some integrations were not sending statistics. The first incident was still open.</td></tr>
+</table></div>
+<div class="pair">
+<figure><img src="images/09-alert-email.png" alt="Alert email saying the CoreDNS cache hit percentage is 63.253, below 80 for 3 minutes"><figcaption>The threshold alert email.</figcaption></figure>
+<figure><img src="images/10-incidents.png" alt="Incidents list showing the open CoreDNS incident and a newer open Heartbeat incident"><figcaption>Both incidents in the list.</figcaption></figure>
+</div>
+
+<h3>Three things that slowed me down</h3>
+
+<div class="finding">
+<h3>1. The Kubernetes route isn’t written down yet</h3>
+<p>The knowledge base article says to run the agent as a DaemonSet but shows no steps. The docs page says to enable the integration on the server where CoreDNS is installed and expects metrics at localhost. In a cluster, that leaves a newcomer at a greyed out Enable button. The command line’s host prompt is what solves it, and I couldn’t find it written anywhere. When I mistyped the address by one digit, the error only said it failed to connect, without naming the address.</p>
+<p class="fix"><b>Suggested fix.</b> Add a short Kubernetes section to the CoreDNS docs page: find the service address with one <code>kubectl</code> command, check it with <code>curl</code>, then enter it in <code>xitogent integrate</code>. Put the address in the error message. If a DaemonSet is the recommended route, a ready made manifest would help most.</p>
+</div>
+
+<div class="finding">
+<h3>2. Two docs sentences no longer match the product</h3>
+<p>The Server Monitoring page says triggers are created from the Server overview page. On 17 November I couldn’t find the control there, only a small plus icon on the Triggers tab. By 18 November the tab had an Add trigger button, so the product has already improved. Separately, the docs have a page for <code>xitogent status</code>, but the CLI overview doesn’t list it and my agent said the command doesn’t exist.</p>
+<p class="fix"><b>Suggested fix.</b> Point the triggers sentence at the Triggers tab and Add trigger button, with one screenshot. Either list <code>status</code> with the version or platform it belongs to, or retire its page.</p>
+</div>
+
+<div class="finding">
+<h3>3. The “agent stopped reporting” email carries credentials</h3>
+<p>When my laptop lost power overnight, Xitoring emailed me, which I loved because it was a real alert. But the email body held the server’s registration key, ID and password in plain text, next to a one line fix command. Emails get forwarded, screenshotted and kept for years.</p>
+<p class="fix"><b>Suggested fix.</b> Link to the server page, where the fix command can sit behind a login, or switch the command to a short lived token.</p>
+</div>
+
+<h3>What looks odd inside a container</h3>
+<p>The docs don’t mention containers, so a few things looked strange. The memory and disk figures looked like the machine underneath, not a limit on the node (I didn’t confirm where they come from). The Services panel listed 49 services, and the first five I saw were marked dead, such as the display manager and emergency shell, which a kind node isn’t meant to run. I didn’t check the rest.</p>
+
+<h2>4. What that means</h2>
+<ul>
+<li><b>The product held up.</b> The install, the graphs and both alerts worked, and the alert reached my inbox within minutes.</li>
+<li><b>The gap is documentation, not the software.</b> One missing paragraph about the host prompt is the difference between a Kubernetes user succeeding and giving up at a greyed out button.</li>
+<li><b>Two kinds of alert are worth keeping.</b> A threshold alert says CoreDNS is working badly. A silence alert says the data stopped. They caught different things in my test.</li>
+<li><b>The fixes are small.</b> A docs section, two corrected sentences and a safer email would remove nearly every snag I hit.</li>
+</ul>
+<p>I only tested inside a kind node. I did not test the DaemonSet route, a cluster with more than one node, other CoreDNS versions or paid plan limits. The natural next step is to write the Kubernetes docs section and test the DaemonSet properly.</p>
+
+<footer>
+Written by Mumpe Cydrone. <a href="https://mumpe-cydrone-portfolio.vercel.app/">Portfolio</a> and <a href="https://github.com/Cydo73">GitHub</a>.
+</footer>
+
+</main>
+</body>
+</html>
